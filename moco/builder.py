@@ -5,9 +5,12 @@
 
 import torch
 import torch.nn as nn
+from pytorch_lightning import LightningModule
+
+from utils_mochi import mixing_for_even_harder_negatives, mixing_hardest_negative
 
 
-class MoCo(nn.Module):
+class MoCo(LightningModule):
     """
     Build a MoCo model with: a query encoder, a key encoder, and a queue
     https://arxiv.org/abs/1911.05722
@@ -20,7 +23,7 @@ class MoCo(nn.Module):
         m: moco momentum of updating key encoder (default: 0.999)
         T: softmax temperature (default: 0.07)
         """
-        super(MoCo, self).__init__()
+        super().__init__()
 
         self.K = K
         self.m = m
@@ -65,12 +68,14 @@ class MoCo(nn.Module):
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys):
         # gather keys before updating queue
-        keys = concat_all_gather(keys)
+        keys = self.trainer.strategy.all_gather(keys)
+        if keys.dim() > 2:
+            keys = keys.flatten(end_dim=1)
 
         batch_size = keys.shape[0]
 
         ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0  # for simplicity
+        assert self.K % batch_size == 0, f"{self.K=} {batch_size=}"  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
         self.queue[:, ptr : ptr + batch_size] = keys.T
@@ -86,23 +91,25 @@ class MoCo(nn.Module):
         """
         # gather from all gpus
         batch_size_this = x.shape[0]
-        x_gather = concat_all_gather(x)
+        x_gather = self.trainer.strategy.all_gather(x)
+        if x_gather.dim() > 4:
+            x_gather = x_gather.flatten(end_dim=1)
         batch_size_all = x_gather.shape[0]
 
         num_gpus = batch_size_all // batch_size_this
 
         # random shuffle index
-        idx_shuffle = torch.randperm(batch_size_all).cuda()
+        idx_shuffle = torch.randperm(batch_size_all).to(x.device)
 
         # broadcast to all gpus
-        torch.distributed.broadcast(idx_shuffle, src=0)
+        self.trainer.strategy.broadcast(idx_shuffle, src=0)
 
         # index for restoring
         idx_unshuffle = torch.argsort(idx_shuffle)
 
         # shuffled index for this gpu
-        gpu_idx = torch.distributed.get_rank()
-        idx_this = idx_shuffle.view(num_gpus, -1)[gpu_idx]
+        gpu_idx = self.trainer.global_rank
+        idx_this = idx_shuffle.reshape(num_gpus, -1)[gpu_idx]
 
         return x_gather[idx_this], idx_unshuffle
 
@@ -114,18 +121,77 @@ class MoCo(nn.Module):
         """
         # gather from all gpus
         batch_size_this = x.shape[0]
-        x_gather = concat_all_gather(x)
+        x_gather = self.trainer.strategy.all_gather(x)
+        if x_gather.dim() > 2:
+            x_gather = x_gather.flatten(end_dim=1)
         batch_size_all = x_gather.shape[0]
 
         num_gpus = batch_size_all // batch_size_this
 
         # restored index for this gpu
-        gpu_idx = torch.distributed.get_rank()
-        idx_this = idx_unshuffle.view(num_gpus, -1)[gpu_idx]
+        gpu_idx = self.trainer.global_rank
+        idx_this = idx_unshuffle.reshape(num_gpus, -1)[gpu_idx]
 
         return x_gather[idx_this]
 
-    def forward(self, im_q, im_k):
+    def forward(self, im_q, im_k, is_mochi: bool):
+        is_warmup = self.current_epoch < self.args.mochi_warmup
+
+        if not is_mochi or is_warmup:
+            return self.forward_moco(im_q, im_k)
+        else:
+            return self.forward_mochi(im_q, im_k)
+
+    def forward_moco(self, im_q, im_k):
+        """
+        Input:
+            im_q: a batch of query images
+            im_k: a batch of key images
+        Output:
+            logits, targets
+        """
+
+        # compute query features
+        q = self.encoder_q(im_q)  # queries: NxC
+        q = nn.functional.normalize(q, dim=1)
+
+        # compute key features
+        with torch.no_grad():  # no gradient to keys
+            self._momentum_update_key_encoder()  # update the key encoder
+
+            # shuffle for making use of BN
+            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+
+            k = self.encoder_k(im_k)  # keys: NxC
+            k = nn.functional.normalize(k, dim=1)
+
+            # undo shuffle
+            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+
+        # compute logits
+        # Einstein sum is more intuitive
+        # positive logits: Nx1
+        l_pos = torch.einsum("nc,nc->n", [q, k]).unsqueeze(-1)  # [b dim] [b dim]
+        # negative logits: NxK
+        l_neg = torch.einsum(
+            "nc,ck->nk", [q, self.queue.clone().detach()]
+        )  # [b dim] [dim K]
+
+        # logits: Nx(1+K)
+        logits = torch.cat([l_pos, l_neg], dim=1)
+
+        # apply temperature
+        logits /= self.T
+
+        # labels: positive key indicators
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
+
+        # dequeue and enqueue
+        self._dequeue_and_enqueue(k)
+
+        return logits, labels
+
+    def forward_mochi(self, im_q, im_k):
         """
         Input:
             im_q: a batch of query images
@@ -155,17 +221,43 @@ class MoCo(nn.Module):
         # Einstein sum is more intuitive
         # positive logits: Nx1
         l_pos = torch.einsum("nc,nc->n", [q, k]).unsqueeze(-1)
-        # negative logits: NxK
-        l_neg = torch.einsum("nc,ck->nk", [q, self.queue.clone().detach()])
 
-        # logits: Nx(1+K)
+        # negative logits: NxK
+        l_neg_queue = torch.einsum("nc,ck->nk", [q, self.queue.clone().detach()])
+
+        # region 4.1 Mixing the hardest negatives
+        H, tilde_Q_N = mixing_hardest_negative(
+            q=q,
+            n=self.queue.T,
+            s=self.args.mochi_s,
+            tau=self.args.mochi_tau,
+            N=self.args.mochi_N,
+            tilde_Q=l_neg_queue,
+        )
+        # endregion
+
+        # region 4.2 Mixing for even harder negatives
+        H_prime = mixing_for_even_harder_negatives(
+            q=q,
+            tilde_Q_N=tilde_Q_N,
+            s_prime=self.args.mochi_s_prime,
+        )
+        # endregion
+
+        # hard negative H and H_prime
+        negatives = torch.cat([H, H_prime], dim=1).detach()
+        l_neg_hard = torch.einsum("bd,bsd->bs", [q, negatives])
+
+        l_neg = torch.cat([l_neg_queue, l_neg_hard], dim=1)
+
+        # logits: Nx(1+K+s+s')
         logits = torch.cat([l_pos, l_neg], dim=1)
 
         # apply temperature
         logits /= self.T
 
         # labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
 
         # dequeue and enqueue
         self._dequeue_and_enqueue(k)

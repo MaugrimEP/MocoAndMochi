@@ -1,0 +1,14 @@
+PROJECTNAME=osvm
+
+rm -rf ~/packages/$PROJECTNAME
+mkdir ~/packages/$PROJECTNAME
+
+module purge
+module load python3-DL/torch/1.12.1-cuda10.2
+export PYTHONUSERBASE=~/packages/$PROJECTNAME
+PATH=$PATH:~/packages/$PROJECTNAME/bin
+export PATH
+
+pip install --upgrade pip
+
+pip install --user --no-cache-dir numpy torch blobfile tqdm pyYaml pillow jaxtyping beartype pytorch-lightning omegaconf hydra-core
